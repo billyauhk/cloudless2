@@ -32,11 +32,11 @@ int main(int argc, char* argv[]){
   uint16_t band_number;
   uint64_t xsize, ysize;
 
-// Output buffer using OpenCV facility  
+// Output buffer using OpenCV facility
   int bandArray[1];
   Mat imageBuffer;
   Mat outputBuffer;
-  
+
 // Check arguments
   if(argc<2){
     fprintf(stderr,"Not enough argument!\n");exit(-1);
@@ -103,7 +103,11 @@ int main(int argc, char* argv[]){
 
   // Adjust the radiance as told by the metadata file
 
-  // Display the data if it is not band 8 (panochromatic band takes too much RAM)
+  // Save data into a container, but not effective as the file is too large
+  // Will attempt saving possibly after cloud-masking
+/*  FileStorage storage("image.yaml.gz", FileStorage::WRITE);
+  storage << "data" << outputBuffer;
+  storage.release();*/
 
   // Free the resources
     for(band_number=1;band_number<=numChannel;band_number++){
