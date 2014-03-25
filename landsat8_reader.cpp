@@ -21,13 +21,22 @@ using namespace cv;
 using namespace std;
 
 int main(int argc, char* argv[]){
-  GDALDataset *poDataset = NULL;
+
+// Input filename
   char *basename, *filename;
   uint16_t basenameLength;
-  Mat imageBuffer;
-  uint64_t xsize, ysize;
-  uint8_t band_number;
 
+// Data to be loaded
+  uint16_t numChannel = 11;  // Hard-coded as we know there must be 11 channels
+  GDALDataset *poDataset[numChannel]; // Input dataset: 11 channels of Landsat 8
+  uint16_t band_number;
+  uint64_t xsize, ysize;
+
+// Output buffer using OpenCV facility  
+  int bandArray[1];
+  Mat imageBuffer;
+  Mat outputBuffer;
+  
 // Check arguments
   if(argc<2){
     fprintf(stderr,"Not enough argument!\n");exit(-1);
@@ -42,46 +51,66 @@ int main(int argc, char* argv[]){
 // Prepare the GDAL driver
   GDALAllRegister();
 
-  for(band_number=1;band_number<=11;band_number++){
+  for(band_number=1;band_number<=numChannel;band_number++){
     // Construct file name
     strcpy(filename, basename);
     sprintf(filename+basenameLength, "_B%d.TIF", band_number);
 
     // Open file
-      poDataset = (GDALDataset*) GDALOpen(filename, GA_ReadOnly);
-      if(!poDataset){
+      poDataset[band_number-1] = (GDALDataset*) GDALOpen(filename, GA_ReadOnly);
+      if(!poDataset[band_number-1]){
         fprintf(stderr,"File cannot be opened!\n");exit(-1);
+      }else{
+        fprintf(stderr,"File %s opened.\n", filename);
       }
-
-    // Print some metadata
-      printf("Filename: %s\n", filename);
-      xsize = poDataset->GetRasterXSize();
-      ysize = poDataset->GetRasterYSize();
-      printf("Raster Size: %d x %d\n", xsize, ysize);
-      printf("Raster Count: %d\n", poDataset->GetRasterCount());
-
-    // Read Image data
-      imageBuffer.create(ysize, xsize, CV_32FC1);
-      poDataset->RasterIO(GF_Read, 0, 0, xsize, ysize,
-                          (void*) imageBuffer.ptr(0), xsize, ysize,
-                          GDT_Float32, 1, NULL, 0, 0, 0);
-
-    // One should be able to get coordinate with GDALApplyGeoTransform() (or maybe also GDALInvGeoTransform())
-
-    // Adjust the radiance as told by the metadata file
-
-    // Display the data if it is not band 8 (panochromatic band takes too much RAM)
-      imageBuffer.convertTo(imageBuffer, CV_16UC1);
-      normalize(imageBuffer, imageBuffer, 0, 65535, NORM_MINMAX);
-      namedWindow("Thumbnail",CV_GUI_EXPANDED);
-      imshow("Thumbnail", imageBuffer);
-      waitKey(0);
-      destroyWindow("Thumbnail");
-
-      imageBuffer.release(); // Complusorily free memory
-      delete poDataset; poDataset = NULL;
   }
-  free(filename);
+
+  // Print some metadata
+    printf("Basename: %s\n", basename);
+    // Get the size of the panochromatic image
+    if(numChannel>=8){
+      xsize = poDataset[8-1]->GetRasterXSize();
+      ysize = poDataset[8-1]->GetRasterYSize();
+      printf("Panochromatic Raster Size: %d x %d\n", xsize, ysize);
+    }
+    xsize = poDataset[0]->GetRasterXSize();
+    ysize = poDataset[0]->GetRasterYSize();
+    printf("Others Raster Size: %d x %d\n", xsize, ysize);
+
+  // Read Image data, skip panochromatic band (otherwise OOM)
+    imageBuffer.create(ysize, xsize, CV_32FC1);
+    outputBuffer.create(ysize, xsize, CV_32FC(numChannel));
+    outputBuffer.zeros(ysize, xsize, CV_32FC(numChannel));
+
+    for(band_number=1;band_number<=numChannel;band_number++){
+      if(band_number!=8){
+        fprintf(stderr,"Reading data from band %d...",band_number);
+        bandArray[0] = 1;
+        imageBuffer.zeros(ysize, xsize, CV_32FC1);
+        poDataset[band_number-1]->RasterIO(GF_Read, 0, 0, xsize, ysize,
+                                           (void*) imageBuffer.ptr(0), xsize, ysize,
+                                           GDT_Float32, 1, bandArray, 0, 0, 0);
+        for(int x=0;x<xsize;x++){
+          for(int y=0;y<ysize;y++){
+            ((float*)(outputBuffer.data))[(y*xsize+x)*numChannel+(band_number-1)] = ((float*)(imageBuffer.data))[y*xsize+x];
+          }
+        }
+        fprintf(stderr,"...done\n");fflush(stderr);
+      }
+    }
+
+  // One should be able to get coordinate with GDALApplyGeoTransform() (or maybe also GDALInvGeoTransform())
+
+  // Adjust the radiance as told by the metadata file
+
+  // Display the data if it is not band 8 (panochromatic band takes too much RAM)
+
+  // Free the resources
+    for(band_number=1;band_number<=numChannel;band_number++){
+      delete poDataset[band_number-1];
+      poDataset[band_number-1] = NULL;
+    }
+    free(filename);
 
   return 0;
 }
