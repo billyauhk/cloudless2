@@ -42,7 +42,7 @@ int main(int argc, char* argv[]){
   uint16_t basenameLength;
 
 // Data to be loaded
-  uint16_t numChannel = 11;  // Hard-coded as we know there must be 11 channels
+  uint16_t numChannel = 8;  // Hard-coded as we know there must be 11 channels
   GDALDataset *poDataset[numChannel]; // Input dataset: 11 channels of Landsat 8
   uint16_t band_number;
   uint64_t xsize, ysize;
@@ -55,7 +55,6 @@ int main(int argc, char* argv[]){
 
 // Output buffer using OpenCV facility
   int bandArray[1];
-  Mat imageBuffer;
   Mat outputBuffer;
 
 // Check arguments
@@ -109,45 +108,77 @@ int main(int argc, char* argv[]){
 
   // Read Image data at 30m
   // While skip panochromatic band (otherwise OOM)
-    imageBuffer.create(ysize, xsize, CV_32FC1);
     outputBuffer.create(ysize, xsize, CV_32FC(numChannel));
     outputBuffer.zeros(ysize, xsize, CV_32FC(numChannel));
 
 /* Image reading and adjust: Pipeline as follows:
    Part(1): Band-by-band Possible Processing
-            DN -> TOA Radiance -> TOA reflectance
-   At the time I do not plan on cloud-shadow masking yet...
+            DN -> TOA Radiance -> Surface reflectance
 */
-
     for(band_number=1;band_number<=numChannel;band_number++){
       if(band_number!=8){
-        fprintf(stderr,"Reading data from band %d...",band_number);
+        printf("Reading data from band %d...",band_number);
         bandArray[0] = 1;
-        imageBuffer.zeros(ysize, xsize, CV_32FC1);
+        Mat imageBuffer;
+        imageBuffer.create(ysize, xsize, CV_16UC1);
+  // Load data in as uint16_t (i.e., GDT_UInt16 or CV_16U)
+        imageBuffer.zeros(ysize, xsize, CV_16UC1);
         poDataset[band_number-1]->RasterIO(GF_Read, 0, 0, xsize, ysize,
                                            (void*) imageBuffer.ptr(0), xsize, ysize,
-                                           GDT_Float32, 1, bandArray, 0, 0, 0);
+                                           GDT_UInt16, 1, bandArray, 0, 0, 0);
+    // Find the minimum non-zero value which would be corresponds to Lhaze_1%rad later
+        uint16_t minNonZero = 65535;
+        uint64_t noDataCount = 0;
+        for(int x=0;x<xsize;x++){
+          for(int y=0;y<ysize;y++){
+            uint16_t value = ((uint16_t*)(imageBuffer.data))[y*xsize+x];
+            if(value==0){noDataCount++;}
+            else if(value<minNonZero){minNonZero=value;}
+          }
+        }
 
   /* Get the TOA reflectance, solar angle adjusted with metadata basename_MTL.txt
      For landsat 7 documentation is at: http://landsathandbook.gsfc.nasa.gov/data_prod/prog_sect11_3.html
-     For landsat 8 documentation is at: http://www.yale.edu/ceo/Documentation/Landsat_DN_to_Reflectance.pdf
+                                        http://www.yale.edu/ceo/Documentation/Landsat_DN_to_Reflectance.pdf
+     For landsat 8 documentation is at: http://www.gisagmaps.com/landsat-8-data-tutorial/
   */
+
+        Mat noData = (imageBuffer==0);
+  // Conversion to TOA Radiance
         sprintf(itemname, "RADIANCE_MULT_BAND_%u = ", band_number);
         multValue = readMeta(itemname);
         sprintf(itemname, "RADIANCE_ADD_BAND_%u = ", band_number);
         addValue = readMeta(itemname);
+        // Pixels Being zero in DN is always regarded as no data
+        imageBuffer.convertTo(imageBuffer, CV_32F, multValue, addValue);
 
-  // Conversion to TOA Radiance
-        imageBuffer = imageBuffer*multValue + addValue;
-  // Conversion to TOA Reflectance
-        imageBuffer = imageBuffer;
+  // Conversion to Surface Reflectance using DOS (Dark-object Subtraction)
+  // [Chavez P.S. 1996], TAUv and TAUz both equals 1.0, Edown = 0.0
+
+        float distance = readMeta("EARTH_SUN_DISTANCE = ");
+    // ESUN values NOT from USGS/NASA, but here http://www.gisagmaps.com/landsat-8-atco/
+    // Bands without values are, at the time being, assigned to be 1000.0
+    // Will have to compute ESUN values on my own later
+        float Esun[11] = {1000.0, 2067.0, 1893.0, 1603.0, 972.6, 245.0, 79.72, 1000.0, 399.7, 1000.0, 1000.0};
+        float angle = 90.0-readMeta("SUN_ELEVATION = ");
+    // A loop to find the Lhaze_1%rad.
+        float lHazeOnePercent = minNonZero*multValue+addValue;
+        imageBuffer = PI*(imageBuffer-lHazeOnePercent)*distance*distance/(Esun[band_number-1]*cos(PI*angle/180.0));
+
+  // Re-enact no-data mask
+        //imageBuffer = imageBuffer.setTo(NAN, noData);
+
   // Copy to output array
+        float min = 1e9;
+        float max = -1e9;
         for(int x=0;x<xsize;x++){
           for(int y=0;y<ysize;y++){
+            if(((float*)(imageBuffer.data))[y*xsize+x] < min){min =((float*)(imageBuffer.data))[y*xsize+x];}
+            if(((float*)(imageBuffer.data))[y*xsize+x] > max){max =((float*)(imageBuffer.data))[y*xsize+x];}
             ((float*)(outputBuffer.data))[(y*xsize+x)*numChannel+(band_number-1)] = ((float*)(imageBuffer.data))[y*xsize+x];
           }
         }
-        fprintf(stderr,"...done\n");fflush(stderr);
+        printf("...done (noData pixels = %lu, Min nonzero value is %u, minmax = %f, %f)\n", noDataCount, minNonZero, min, max);
       }
     }
 
@@ -168,6 +199,34 @@ int main(int argc, char* argv[]){
 
   // One should be able to get coordinate with GDALApplyGeoTransform() (or maybe also GDALInvGeoTransform())
 
+  // Temporary saving routine converting the data to 8-bit RGB JPEG
+  Mat outputPNG( ysize, xsize, CV_32FC3);
+  normalize(outputBuffer, outputBuffer, 65536, 0, NORM_MINMAX, -1);
+/*
+  printf("Normalize!!\n");
+  for(band_number=1;band_number<=numChannel;band_number++){
+    float min = 1e9;
+    float max = -1e9;
+    for(int x=0;x<xsize;x++){
+      for(int y=0;y<ysize;y++){
+        float value = ((float*)(outputBuffer.data))[(y*xsize+x)*numChannel+(band_number-1)];
+        if(value < min){min = value;}
+        if(value > max){max = value;}
+      }
+    }
+    printf("Channel %u, min = %f\tmax = %f\n", band_number, min, max);
+  }
+*/
+
+  // forming an array of matrices is a quite efficient operation,
+  // because the matrix data is not copied, only the headers
+  int from_to[] = {2-1,0, 3-1,1, 4-1,2};
+  mixChannels( &outputBuffer, 1, &outputPNG, 1, from_to, 3);
+  outputBuffer.create(1, 1, CV_8U); // Indirectly delete all things in outputBuffer
+  outputPNG.convertTo(outputPNG, CV_16U);
+  //resize(outputPNG, outputPNG, Size(), 0.1, 0.1, INTER_NEAREST);
+  imwrite("test.tiff", outputPNG);
+
   // Save using OpenCV's YAML.gz, but is not efficient at all
 /*  FileStorage storage("image.yaml.gz", FileStorage::WRITE);
   storage << "data" << outputBuffer;
@@ -180,5 +239,6 @@ int main(int argc, char* argv[]){
     }
     free(filename);
 
+  printf("Program completed normally.\n");
   return 0;
 }
