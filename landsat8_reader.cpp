@@ -172,6 +172,7 @@ printf("===STAGE 1: DN -> TOA Radiance -> Surface reflectance===\n");
       float max = -1e9;
       float* imgData = ((float*)(imageBuffer.data));
       float* outData = ((float*)(outputBuffer.data));
+      #pragma omp parallel for reduction(min:min) reduction(max:max)
       for(int x=0;x<xsize;x++){
         for(int y=0;y<ysize;y++){
           if(imgData[y*xsize+x] < min){min = imgData[y*xsize+x];}
@@ -219,17 +220,17 @@ printf("===STAGE 2: Mask Creation===\n");
      printf("Mask created. %u/%u pixels masked out.\n", noDataCount, xsize*ysize);
   }
 
+
+//// SPECIAL COMMENT ON 13 Apr 2014: Since the upcoming research will involve searchinof for replacement of PANSHARP, so it is not implemented here
 /* Image masking and spatial processing: Pipeline as follows:
    Part(3): Zooming, Read Panochromatic -> PANSHARP
             -> Output 3-channel PANSHARP-ed+Alpha 32-bit GeoTIFF, with NaN if necessary (OpenCV imwrite is not GeoTIFF/32-bit depth friendly)
 */
-printf("===STAGE 3: Pansharp===\n");
+printf("===STAGE 3: Pansharp=== (SKIPPED)\n");
   // One should be able to get coordinate with GDALApplyGeoTransform() (or maybe also GDALInvGeoTransform())
 
-
-
   // Temporary saving routine converting the data to 8-bit RGB JPEG
-printf("===STAGE 4: Store the Result\n");
+printf("===STAGE 4: Store the Result===\n");
   Mat outputPNG(ysize, xsize, CV_32FC3);
   normalize(outputBuffer, outputBuffer, 65536, 0, NORM_MINMAX, -1);
 
@@ -243,6 +244,38 @@ printf("===STAGE 4: Store the Result\n");
 /*  FileStorage storage("image.yaml.gz", FileStorage::WRITE);
   storage << "data" << outputBuffer;
   storage.release();*/
+
+  // Saving using GDAL's writing facility
+    // Create driver and dataset
+    GDALDataset *outputDataset = NULL;
+    GDALDriver* geoTiffDriver = GetGDALDriverManager()->GetDriverByName("GTiff");
+    char **papszMetadata;
+
+    if(geoTiffDriver == NULL){
+      fprintf(stderr,"Cannot retrieve Driver!\n");exit(-1);
+    }
+
+    papszMetadata = GDALGetMetadata(geoTiffDriver, NULL);
+    if(!CSLFetchBoolean(papszMetadata, GDAL_DCAP_CREATE, FALSE)){
+      fprintf(stderr,"Driver %s does not support Create() method.\n", "GTiff");
+    }
+
+    // OpenCV -> Pixel interleaving; GDAL -> (Should I choose?)
+    // (The suffix must be .tif? Strange GDAL)
+    outputDataset = geoTiffDriver->Create("clear_geotiff.tif", xsize, ysize, 3+1, GDT_Float32, NULL);
+    if(outputDataset == NULL){
+      fprintf(stderr,"Cannot open new dataset.\n");exit(-1);
+    }else{
+      fprintf(stderr,"Dataset opened, time for GEOREF, DATA and ALPHA\n");
+    }
+
+    // Copy projection and georef from the source GeoTIFF
+
+    // Copy data from the OpenCV image to GDAL
+
+    // Set the Alpha channel?
+
+    delete outputDataset; // Close file?
 
   // Free the resources
     for(band=0;band<=11;band++){
