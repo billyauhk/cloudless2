@@ -21,13 +21,15 @@ And, at last, write out pixels with valid observation into a file...spatialLite/
 #include <stdint.h>
 #include <string.h>
 
+#include <omp.h>
+
 // Constants
 #define PI (3.14159265359)
 
 using namespace cv;
 using namespace std;
 
-// Metadata file content buffe
+// Metadata file content buffer
 // 20k buffer for nominally 7k file should be safe
 char fileContent[20000] = {0};
 
@@ -46,9 +48,9 @@ int main(int argc, char* argv[]){
   uint16_t basenameLength;
 
 // Data to be loaded
-  uint16_t numChannel = 8;  // Hard-coded as we know there must be 11 channels
-  GDALDataset *poDataset[numChannel]; // Input dataset: 11 channels of Landsat 8
-  uint16_t band_number;
+  // RGB(432) + Panochromatic(8) + BQA(BQA)
+  GDALDataset *poDataset[12];
+  uint16_t band;
   uint64_t xsize, ysize;
 
 // The metafile handle
@@ -84,62 +86,65 @@ int main(int argc, char* argv[]){
 // Prepare the GDAL driver
   GDALAllRegister();
 
-  for(band_number=1;band_number<=numChannel;band_number++){
+  for(band=1;band<=12;band++){
     // Construct file name
-    strcpy(filename, basename);
-    sprintf(filename+basenameLength, "_B%d.TIF", band_number);
+    if(band!=12){
+      sprintf(filename, "%s_B%u.TIF", basename, band);
+    }else{
+      sprintf(filename, "%s_BQA.TIF", basename);
+    }
 
     // Open file
-      poDataset[band_number-1] = (GDALDataset*) GDALOpen(filename, GA_ReadOnly);
-      if(!poDataset[band_number-1]){
-        fprintf(stderr,"File cannot be opened!\n");exit(-1);
-      }else{
-        fprintf(stderr,"File %s opened.\n", filename);
-      }
+    poDataset[band-1] = (GDALDataset*) GDALOpen(filename, GA_ReadOnly);
+    if(!poDataset[band-1]){
+      fprintf(stderr,"File cannot be opened!\n");exit(-1);
+    }else{
+      fprintf(stderr,"File %s opened.\n", filename);
+    }
   }
 
   // Print some metadata
-    printf("Basename: %s\n", basename);
-    // Get the size of the panochromatic image
-    if(numChannel>=8){
-      xsize = poDataset[8-1]->GetRasterXSize();
-      ysize = poDataset[8-1]->GetRasterYSize();
-      printf("Panochromatic Raster Size: %lu x %lu\n", xsize, ysize);
-    }
-    xsize = poDataset[0]->GetRasterXSize();
-    ysize = poDataset[0]->GetRasterYSize();
-    printf("Others Raster Size: %lu x %lu\n", xsize, ysize);
+  printf("Basename: %s\n", basename);
+  // Get the size of the panochromatic image
+  xsize = poDataset[8-1]->GetRasterXSize();
+  ysize = poDataset[8-1]->GetRasterYSize();
+  printf("Panochromatic Raster Size: %lu x %lu\n", xsize, ysize);
+  xsize = poDataset[0]->GetRasterXSize();
+  ysize = poDataset[0]->GetRasterYSize();
+  printf("Others Raster Size: %lu x %lu\n", xsize, ysize);
 
   // Read Image data at 30m
   // While skip panochromatic band (otherwise OOM)
-    outputBuffer.create(ysize, xsize, CV_32FC(numChannel));
-    outputBuffer.zeros(ysize, xsize, CV_32FC(numChannel));
+  outputBuffer.create(ysize, xsize, CV_32FC3);
+  outputBuffer.zeros(ysize, xsize, CV_32FC3);
 
 /* Image reading and adjust: Pipeline as follows:
    Part(1): Band-by-band Possible Processing
             DN -> TOA Radiance -> Surface reflectance
 */
-    for(band_number=1;band_number<=numChannel;band_number++){
-      if(band_number!=8){
-        printf("Reading data from band %d...",band_number);
-        bandArray[0] = 1;
-        Mat imageBuffer;
-        imageBuffer.create(ysize, xsize, CV_16UC1);
-  // Load data in as uint16_t (i.e., GDT_UInt16 or CV_16U)
-        imageBuffer.zeros(ysize, xsize, CV_16UC1);
-        poDataset[band_number-1]->RasterIO(GF_Read, 0, 0, xsize, ysize,
-                                           (void*) imageBuffer.ptr(0), xsize, ysize,
-                                           GDT_UInt16, 1, bandArray, 0, 0, 0);
-    // Find the minimum non-zero value which would be corresponds to Lhaze_1%rad later
-        uint16_t minNonZero = 65535;
-        uint64_t noDataCount = 0;
-        for(int x=0;x<xsize;x++){
-          for(int y=0;y<ysize;y++){
-            uint16_t value = ((uint16_t*)(imageBuffer.data))[y*xsize+x];
-            if(value==0){noDataCount++;}
-            else if(value<minNonZero){minNonZero=value;}
-          }
+
+printf("===STAGE 1: DN -> TOA Radiance -> Surface reflectance===\n");
+    for(band=4;band>=2;band--){
+      printf("Reading data from band %d...",band);
+      bandArray[0] = 1;
+      Mat imageBuffer;
+      imageBuffer.create(ysize, xsize, CV_16UC1);
+      // Load data in as uint16_t (i.e., GDT_UInt16 or CV_16U)
+      imageBuffer.zeros(ysize, xsize, CV_16UC1);
+      poDataset[band-1]->RasterIO(GF_Read, 0, 0, xsize, ysize,
+                                         (void*) imageBuffer.ptr(0), xsize, ysize,
+                                         GDT_UInt16, 1, bandArray, 0, 0, 0);
+  // Find the minimum non-zero value which would be corresponds to Lhaze_1%rad later
+      uint16_t minNonZero = 65535;
+      uint64_t noDataCount = 0;
+      #pragma omp parallel for reduction(min:minNonZero) reduction(+:noDataCount)
+      for(int x=0;x<xsize;x++){
+        for(int y=0;y<ysize;y++){
+          uint16_t value = ((uint16_t*)(imageBuffer.data))[y*xsize+x];
+          if(value==0){noDataCount++;}
+          else if(value<minNonZero){minNonZero=value;}
         }
+      }
 
   /* Get the TOA reflectance, solar angle adjusted with metadata basename_MTL.txt
      For landsat 7 documentation is at: http://landsathandbook.gsfc.nasa.gov/data_prod/prog_sect11_3.html
@@ -147,99 +152,157 @@ int main(int argc, char* argv[]){
      For landsat 8 documentation is at: http://www.gisagmaps.com/landsat-8-data-tutorial/
   */
 
-        Mat noData = (imageBuffer==0);
-  // Conversion to TOA Radiance
-        sprintf(itemname, "RADIANCE_MULT_BAND_%u = ", band_number);
-        multValue = readMeta(itemname);
-        sprintf(itemname, "RADIANCE_ADD_BAND_%u = ", band_number);
-        addValue = readMeta(itemname);
-        // Pixels Being zero in DN is always regarded as no data
-        imageBuffer.convertTo(imageBuffer, CV_32F, multValue, addValue);
+      Mat noData = (imageBuffer==0);
+// Conversion to TOA Radiance
+      sprintf(itemname, "RADIANCE_MULT_BAND_%u = ", band);
+      multValue = readMeta(itemname);
+      sprintf(itemname, "RADIANCE_ADD_BAND_%u = ", band);
+      addValue = readMeta(itemname);
+      // Pixels Being zero in DN is always regarded as no data
+      imageBuffer.convertTo(imageBuffer, CV_32F, multValue, addValue);
 
-  // Conversion to Surface Reflectance using DOS (Dark-object Subtraction)
-  // [Chavez P.S. 1996], TAUv and TAUz both equals 1.0, Edown = 0.0
+// Conversion to Surface Reflectance using DOS (Dark-object Subtraction)
+// [Chavez P.S. 1996], TAUv and TAUz both equals 1.0, Edown = 0.0
 
-        float distance = readMeta("EARTH_SUN_DISTANCE = ");
-    // ESUN values NOT from USGS/NASA, but here http://www.gisagmaps.com/landsat-8-atco/
-    // Bands without values are, at the time being, assigned to be 1000.0
-    // Will have to compute ESUN values on my own later
-        float Esun[11] = {1000.0, 2067.0, 1893.0, 1603.0, 972.6, 245.0, 79.72, 1000.0, 399.7, 1000.0, 1000.0};
-        float angle = 90.0-readMeta("SUN_ELEVATION = ");
-    // A loop to find the Lhaze_1%rad.
-        float lHazeOnePercent = minNonZero*multValue+addValue;
-        imageBuffer = PI*(imageBuffer-lHazeOnePercent)*distance*distance/(Esun[band_number-1]*cos(PI*angle/180.0));
+      float distance = readMeta("EARTH_SUN_DISTANCE = ");
+      // ESUN values NOT from USGS/NASA, but here http://www.gisagmaps.com/landsat-8-atco/
+      // Bands without values are, at the time being, assigned to be 1000.0
+      // Will have to compute ESUN values on my own later
+      float Esun[11] = {1000.0, 2067.0, 1893.0, 1603.0, 972.6, 245.0, 79.72, 1000.0, 399.7, 1000.0, 1000.0};
+      float angle = 90.0-readMeta("SUN_ELEVATION = ");
+      // A loop to find the Lhaze_1%rad.
+      float lHazeOnePercent = minNonZero*multValue+addValue;
+      imageBuffer = PI*(imageBuffer-lHazeOnePercent)*distance*distance/(Esun[band-1]*cos(PI*angle/180.0));
 
-  // Re-enact no-data mask
-        //imageBuffer = imageBuffer.setTo(NAN, noData);
+// Re-enact no-data mask
+      imageBuffer = imageBuffer.setTo(NAN, noData);
 
-  // Copy to output array
-        float min = 1e9;
-        float max = -1e9;
-        for(int x=0;x<xsize;x++){
-          for(int y=0;y<ysize;y++){
-            if(((float*)(imageBuffer.data))[y*xsize+x] < min){min =((float*)(imageBuffer.data))[y*xsize+x];}
-            if(((float*)(imageBuffer.data))[y*xsize+x] > max){max =((float*)(imageBuffer.data))[y*xsize+x];}
-            ((float*)(outputBuffer.data))[(y*xsize+x)*numChannel+(band_number-1)] = ((float*)(imageBuffer.data))[y*xsize+x];
-          }
+// Copy to output array
+      float min = 1e9;
+      float max = -1e9;
+      float* imgData = ((float*)(imageBuffer.data));
+      float* outData = ((float*)(outputBuffer.data));
+      #pragma omp parallel for reduction(min:min) reduction(max:max)
+      for(int x=0;x<xsize;x++){
+        for(int y=0;y<ysize;y++){
+          if(imgData[y*xsize+x] < min){min = imgData[y*xsize+x];}
+          if(imgData[y*xsize+x] > max){max = imgData[y*xsize+x];}
+          outData[(y*xsize+x)*3+(band-2)] = imgData[y*xsize+x];
         }
-        printf("...done (noData pixels = %lu, Min nonzero value is %u, minmax = %f, %f)\n", noDataCount, minNonZero, min, max);
       }
+      printf("...done (noData pixels = %lu, Min nonzero value is %u, minmax = %f, %f)\n", noDataCount, minNonZero, min, max);
     }
 
 /* Image masking and spatial processing: Pipeline as follows:
    Part(2): Processing with all bands
-            Cloud Masking -> (Cloud-shadow Masking) -> Maskout no data area
-            -> De-haze -> White-balance using Cloud -> Clipping -> Channel select
+            Cloud Masking -> (Cloud-shadow Masking) -> Maskout no data area -> De-haze
    At the time I do not plan on cloud-shadow masking yet...
-   BTW channel 8 (panochromatic) is used as the temporary alpha MASK
 */
+printf("===STAGE 2: Mask Creation===\n");
+// Cloud mask from the BQA band poDataset[11] is used.
 
+   /*Block for the masking -- abusing C++ scoping*/{
+      Mat imageBuffer;
+      imageBuffer.create(ysize, xsize, CV_16UC1);
+      // Load data in as uint16_t (i.e., GDT_UInt16 or CV_16U)
+      imageBuffer.zeros(ysize, xsize, CV_16UC1);
+      poDataset[11]->RasterIO(GF_Read, 0, 0, xsize, ysize,
+                              (void*) imageBuffer.ptr(0), xsize, ysize,
+                              GDT_UInt16, 1, bandArray, 0, 0, 0);
+      // if it is likely cloud, or it is a fill
+      // Or if any of the existing band is NaN, mark all as NaN
+      // For more detail, read https://landsat.usgs.gov/L8QualityAssessmentBand.php
+      uint64_t noDataCount = 0;
+      #pragma omp parallel for reduction(+:noDataCount) collapse(2)
+      for(int x=0;x<xsize;x++){
+        for(int y=0;y<ysize;y++){
+          float* outBfrData = (float*)(outputBuffer.data);
+          uint16_t value = ((uint16_t*)(imageBuffer.data))[y*xsize+x];
+          float value0 = outBfrData[(y*xsize+x)*3+0];
+          float value1 = outBfrData[(y*xsize+x)*3+1];
+          float value2 = outBfrData[(y*xsize+x)*3+2];
+          if((value&0x81)>0 || isnan(value0) || isnan(value1) || isnan(value2)){
+            noDataCount++;
+            outBfrData[(y*xsize+x)*3+0] = outBfrData[(y*xsize+x)*3+1] = outBfrData[(y*xsize+x)*3+2] = NAN;
+          }
+        }
+      }
+     printf("Mask created. %u/%u pixels masked out.\n", noDataCount, xsize*ysize);
+  }
 
+//// SPECIAL COMMENT ON 13 Apr 2014: Since the upcoming research will involve searching for replacement of PANSHARP, so it is not implemented here
 /* Image masking and spatial processing: Pipeline as follows:
    Part(3): Zooming, Read Panochromatic -> PANSHARP
-            -> Output 4-channel PANSHARP-ed+Alpha 16-bit GeoTIFF?
+            -> Output 3-channel PANSHARP-ed+Alpha 32-bit GeoTIFF, with NaN if necessary (OpenCV imwrite is not GeoTIFF/32-bit depth friendly)
 */
-
-
+printf("===STAGE 3: Pansharp=== (SKIPPED)\n");
   // One should be able to get coordinate with GDALApplyGeoTransform() (or maybe also GDALInvGeoTransform())
 
-  // Temporary saving routine converting the data to 8-bit RGB JPEG
-  Mat outputPNG( ysize, xsize, CV_32FC3);
+printf("===STAGE 4: Store the Result===\n");
   normalize(outputBuffer, outputBuffer, 65536, 0, NORM_MINMAX, -1);
-/*
-  printf("Normalize!!\n");
-  for(band_number=1;band_number<=numChannel;band_number++){
-    float min = 1e9;
-    float max = -1e9;
-    for(int x=0;x<xsize;x++){
-      for(int y=0;y<ysize;y++){
-        float value = ((float*)(outputBuffer.data))[(y*xsize+x)*numChannel+(band_number-1)];
-        if(value < min){min = value;}
-        if(value > max){max = value;}
-      }
+  //outputBuffer.convertTo(outputBuffer, CV_16U);
+
+  // Saving using GDAL's writing facility
+    // Create driver and dataset
+    GDALDataset *outputDataset = NULL;
+    GDALDriver* geoTiffDriver = GetGDALDriverManager()->GetDriverByName("GTiff");
+    char **papszMetadata;
+
+    if(geoTiffDriver == NULL){
+      fprintf(stderr,"Cannot retrieve Driver!\n");exit(-1);
     }
-    printf("Channel %u, min = %f\tmax = %f\n", band_number, min, max);
-  }
-*/
 
-  // forming an array of matrices is a quite efficient operation,
-  // because the matrix data is not copied, only the headers
-  int from_to[] = {2-1,0, 3-1,1, 4-1,2};
-  mixChannels( &outputBuffer, 1, &outputPNG, 1, from_to, 3);
-  outputBuffer.create(1, 1, CV_8U); // Indirectly delete all things in outputBuffer
-  outputPNG.convertTo(outputPNG, CV_16U);
-  //resize(outputPNG, outputPNG, Size(), 0.1, 0.1, INTER_NEAREST);
-  imwrite("test.tiff", outputPNG);
+    papszMetadata = GDALGetMetadata(geoTiffDriver, NULL);
+    if(!CSLFetchBoolean(papszMetadata, GDAL_DCAP_CREATE, FALSE)){
+      fprintf(stderr,"Driver %s does not support Create() method.\n", "GTiff");
+    }
+    char** papszOptions = NULL;
+    papszOptions = CSLSetNameValue( papszOptions, "PHOTOMETRIC", "RGB" );
 
-  // Save using OpenCV's YAML.gz, but is not efficient at all
-/*  FileStorage storage("image.yaml.gz", FileStorage::WRITE);
-  storage << "data" << outputBuffer;
-  storage.release();*/
+    // OpenCV -> Pixel interleaving; GDAL -> (Should I choose?)
+    // (The suffix must be .tif? Strange GDAL)
+    outputDataset = geoTiffDriver->Create("clear_geotiff.tif", xsize, ysize, 3, GDT_UInt16, papszOptions);
+    if(outputDataset == NULL){
+      fprintf(stderr,"Cannot open new dataset.\n");exit(-1);
+    }
+    CSLDestroy(papszOptions);
+
+    // Copy projection and georef from the band 1 source GeoTIFF
+    double affine[6];
+    if(GDALGetGeoTransform(poDataset[0], affine) == CE_None) {
+      GDALSetGeoTransform(outputDataset, affine);
+    }
+    GDALSetProjection(outputDataset, GDALGetProjectionRef(poDataset[0]));
+    fprintf(stderr,"Georeference Set!\n");
+
+    // Copy data from the OpenCV image to GDAL
+    Mat imageBuffer;
+    imageBuffer.create(ysize, xsize, CV_32F);
+    float* imgData = ((float*)(imageBuffer.data));
+    float* outData = ((float*)(outputBuffer.data));
+    for(band=4;band>=2;band--){
+      bandArray[0]=4-band+1;
+      printf("Writing data to band %d\n", band);
+      #pragma omp parallel for collapse(2)
+      for(int x=0;x<xsize;x++){
+        for(int y=0;y<ysize;y++){
+          imgData[y*xsize+x] = outData[(y*xsize+x)*3+(band-2)];
+        }
+      }
+      outputDataset->RasterIO(GF_Write, 0, 0, xsize, ysize,
+                                         (void*) imageBuffer.ptr(0), xsize, ysize,
+                                         GDT_Float32, 1, bandArray, 0, 0, 0);
+    }
+
+    // Set the Alpha channel?
+    fprintf(stderr,"ALPHA channel not set yet\n");
+
+    delete outputDataset; // Close file?
 
   // Free the resources
-    for(band_number=1;band_number<=numChannel;band_number++){
-      delete poDataset[band_number-1];
-      poDataset[band_number-1] = NULL;
+    for(band=0;band<=11;band++){
+      delete poDataset[band];
+      poDataset[band] = NULL;
     }
     free(filename);
 

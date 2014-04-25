@@ -142,6 +142,12 @@ printf("===STAGE 1: DN -> TOA Radiance -> Surface reflectance===\n");
         }
       }
 
+  /* Get the TOA reflectance, solar angle adjusted with metadata basename_MTL.txt
+     For landsat 7 documentation is at: http://landsathandbook.gsfc.nasa.gov/data_prod/prog_sect11_3.html
+                                        http://www.yale.edu/ceo/Documentation/Landsat_DN_to_Reflectance.pdf
+     For landsat 8 documentation is at: http://www.gisagmaps.com/landsat-8-data-tutorial/
+  */
+
       Mat noData = (imageBuffer==0);
 // Conversion to TOA Radiance
       sprintf(itemname, "RADIANCE_MULT_BAND_%u = ", band);
@@ -203,7 +209,7 @@ printf("===STAGE 2: Mask Creation===\n");
       // Or if any of the existing band is NaN, mark all as NaN
       // For more detail, read https://landsat.usgs.gov/L8QualityAssessmentBand.php
       uint64_t noDataCount = 0;
-      #pragma omp parallel for reduction(+:noDataCount)
+      #pragma omp parallel for reduction(+:noDataCount) collapse(2)
       for(int x=0;x<xsize;x++){
         for(int y=0;y<ysize;y++){
           float* outBfrData = (float*)(outputBuffer.data);
@@ -220,8 +226,7 @@ printf("===STAGE 2: Mask Creation===\n");
      printf("Mask created. %u/%u pixels masked out.\n", noDataCount, xsize*ysize);
   }
 
-
-//// SPECIAL COMMENT ON 13 Apr 2014: Since the upcoming research will involve searchinof for replacement of PANSHARP, so it is not implemented here
+//// SPECIAL COMMENT ON 13 Apr 2014: Since the upcoming research will involve searching for replacement of PANSHARP, so it is not implemented here
 /* Image masking and spatial processing: Pipeline as follows:
    Part(3): Zooming, Read Panochromatic -> PANSHARP
             -> Output 3-channel PANSHARP-ed+Alpha 32-bit GeoTIFF, with NaN if necessary (OpenCV imwrite is not GeoTIFF/32-bit depth friendly)
@@ -229,21 +234,9 @@ printf("===STAGE 2: Mask Creation===\n");
 printf("===STAGE 3: Pansharp=== (SKIPPED)\n");
   // One should be able to get coordinate with GDALApplyGeoTransform() (or maybe also GDALInvGeoTransform())
 
-  // Temporary saving routine converting the data to 8-bit RGB JPEG
 printf("===STAGE 4: Store the Result===\n");
-  Mat outputPNG(ysize, xsize, CV_32FC3);
   normalize(outputBuffer, outputBuffer, 65536, 0, NORM_MINMAX, -1);
-
-  outputPNG = outputBuffer;
-  outputBuffer.create(1, 1, CV_8U); // Indirectly delete all things in outputBuffer
-  outputPNG.convertTo(outputPNG, CV_16U);
-  //resize(outputPNG, outputPNG, Size(), 0.1, 0.1, INTER_NEAREST);
-  imwrite("clear.tiff", outputPNG);
-
-  // Save using OpenCV's YAML.gz, but is not efficient at all
-/*  FileStorage storage("image.yaml.gz", FileStorage::WRITE);
-  storage << "data" << outputBuffer;
-  storage.release();*/
+  //outputBuffer.convertTo(outputBuffer, CV_16U);
 
   // Saving using GDAL's writing facility
     // Create driver and dataset
@@ -259,21 +252,46 @@ printf("===STAGE 4: Store the Result===\n");
     if(!CSLFetchBoolean(papszMetadata, GDAL_DCAP_CREATE, FALSE)){
       fprintf(stderr,"Driver %s does not support Create() method.\n", "GTiff");
     }
+    char** papszOptions = NULL;
+    papszOptions = CSLSetNameValue( papszOptions, "PHOTOMETRIC", "RGB" );
 
     // OpenCV -> Pixel interleaving; GDAL -> (Should I choose?)
     // (The suffix must be .tif? Strange GDAL)
-    outputDataset = geoTiffDriver->Create("clear_geotiff.tif", xsize, ysize, 3+1, GDT_Float32, NULL);
+    outputDataset = geoTiffDriver->Create("clear_geotiff.tif", xsize, ysize, 3, GDT_UInt16, papszOptions);
     if(outputDataset == NULL){
       fprintf(stderr,"Cannot open new dataset.\n");exit(-1);
-    }else{
-      fprintf(stderr,"Dataset opened, time for GEOREF, DATA and ALPHA\n");
     }
+    CSLDestroy(papszOptions);
 
-    // Copy projection and georef from the source GeoTIFF
+    // Copy projection and georef from the band 1 source GeoTIFF
+    double affine[6];
+    if(GDALGetGeoTransform(poDataset[0], affine) == CE_None) {
+      GDALSetGeoTransform(outputDataset, affine);
+    }
+    GDALSetProjection(outputDataset, GDALGetProjectionRef(poDataset[0]));
+    fprintf(stderr,"Georeference Set!\n");
 
     // Copy data from the OpenCV image to GDAL
+    Mat imageBuffer;
+    imageBuffer.create(ysize, xsize, CV_32F);
+    float* imgData = ((float*)(imageBuffer.data));
+    float* outData = ((float*)(outputBuffer.data));
+    for(band=4;band>=2;band--){
+      bandArray[0]=4-band+1;
+      printf("Writing data to band %d\n", band);
+      #pragma omp parallel for collapse(2)
+      for(int x=0;x<xsize;x++){
+        for(int y=0;y<ysize;y++){
+          imgData[y*xsize+x] = outData[(y*xsize+x)*3+(band-2)];
+        }
+      }
+      outputDataset->RasterIO(GF_Write, 0, 0, xsize, ysize,
+                                         (void*) imageBuffer.ptr(0), xsize, ysize,
+                                         GDT_Float32, 1, bandArray, 0, 0, 0);
+    }
 
     // Set the Alpha channel?
+    fprintf(stderr,"ALPHA channel not set yet\n");
 
     delete outputDataset; // Close file?
 
