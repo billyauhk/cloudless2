@@ -257,7 +257,8 @@ printf("===STAGE 4: Store the Result===\n");
 
     // OpenCV -> Pixel interleaving; GDAL -> (Should I choose?)
     // (The suffix must be .tif? Strange GDAL)
-    outputDataset = geoTiffDriver->Create("clear_geotiff.tif", xsize, ysize, 3, GDT_UInt16, papszOptions);
+    sprintf(filename,"%s_clear.tif",basename);
+    outputDataset = geoTiffDriver->Create(filename, xsize, ysize, 3, GDT_UInt16, papszOptions);
     if(outputDataset == NULL){
       fprintf(stderr,"Cannot open new dataset.\n");exit(-1);
     }

@@ -1,7 +1,5 @@
 /*
-Notice that this code is just a branch of the unfinished landsat8 program on 27Mar2014
-We fought for common processing pipeline but is severely affected by the memory bound
-That's why we are splitting the effort.
+This code is modified from the Landsat 8 program to make it workable with Landsat 7 data on 08May2014.
 
 Landsat 7 GeoTIFF reader. Use GDAL to extract the UInt16 as Float32, and put into OpenCV Mat
 Then we could use OpenCV-based method to compute the necessary stuff.
@@ -48,22 +46,22 @@ int main(int argc, char* argv[]){
   uint16_t basenameLength;
 
 // Data to be loaded
-  // RGB(432) + Panochromatic(8) + BQA(BQA)
-  GDALDataset *poDataset[12];
+  // RGB(321) + Panochromatic(8)
+  GDALDataset *poDataset[9];
   uint16_t band;
   uint64_t xsize, ysize;
 
-// The metafile handle
+  // The metafile handle
   FILE* infile;
   char itemname[100];
   uint32_t fileSize = 0;
   double multValue, addValue;
 
-// Output buffer using OpenCV facility
+  // Output buffer using OpenCV facility
   int bandArray[1];
   Mat outputBuffer;
 
-// Check arguments
+  // Check arguments
   if(argc<2){
     fprintf(stderr,"Not enough argument!\n");exit(-1);
   }
@@ -83,15 +81,22 @@ int main(int argc, char* argv[]){
   }
   printf("Metadata File size: %d\n",fileSize);
 
-// Prepare the GDAL driver
+  // Prepare the GDAL driver
   GDALAllRegister();
 
-  for(band=1;band<=12;band++){
+  for(band=1;band<=9;band++){
     // Construct file name
-    if(band!=12){
-      sprintf(filename, "%s_B%u.TIF", basename, band);
-    }else{
-      sprintf(filename, "%s_BQA.TIF", basename);
+    switch(band){
+      case 1: case 2: case 3: case 4: case 5:
+        sprintf(filename, "%s_B%u.TIF", basename, band);break;
+      case 6:
+        sprintf(filename, "%s_B6_VCID_1.TIF", basename);break;
+      case 7:
+        sprintf(filename, "%s_B6_VCID_2.TIF", basename);break;
+      case 8: case 9:
+        sprintf(filename, "%s_B%u.TIF", basename, band-1);break;
+      default:
+        fprintf(stderr,"Unexpected band value!\n");break;
     }
 
     // Open file
@@ -106,8 +111,8 @@ int main(int argc, char* argv[]){
   // Print some metadata
   printf("Basename: %s\n", basename);
   // Get the size of the panochromatic image
-  xsize = poDataset[8-1]->GetRasterXSize();
-  ysize = poDataset[8-1]->GetRasterYSize();
+  xsize = poDataset[8]->GetRasterXSize();
+  ysize = poDataset[8]->GetRasterYSize();
   printf("Panochromatic Raster Size: %lu x %lu\n", xsize, ysize);
   xsize = poDataset[0]->GetRasterXSize();
   ysize = poDataset[0]->GetRasterYSize();
@@ -124,7 +129,7 @@ int main(int argc, char* argv[]){
 */
 
 printf("===STAGE 1: DN -> TOA Radiance -> Surface reflectance===\n");
-    for(band=4;band>=2;band--){
+    for(band=3;band>=1;band--){
       printf("Reading data from band %d...",band);
       bandArray[0] = 1;
       Mat imageBuffer;
@@ -164,11 +169,14 @@ printf("===STAGE 1: DN -> TOA Radiance -> Surface reflectance===\n");
 // Conversion to Surface Reflectance using DOS (Dark-object Subtraction)
 // [Chavez P.S. 1996], TAUv and TAUz both equals 1.0, Edown = 0.0
 
-      float distance = readMeta("EARTH_SUN_DISTANCE = ");
-      // ESUN values NOT from USGS/NASA, but here http://www.gisagmaps.com/landsat-8-atco/
+      char doy_string[4];
+      memcpy(doy_string,basename+13,3);doy_string[3]='\0';
+      fprintf(stderr,"EARTH_SUN_DISTANCE computed from DOY=%d!", atoi(doy_string));
+      float distance = 1.0-0.01674*cos(0.9856*(atoi(doy_string)-4)*PI/180);
+      // ESUN should be working but a bluish tint is still there. Investigating.
       // Bands without values are, at the time being, assigned to be 1000.0
       // Will have to compute ESUN values on my own later
-      float Esun[11] = {1000.0, 2067.0, 1893.0, 1603.0, 972.6, 245.0, 79.72, 1000.0, 399.7, 1000.0, 1000.0};
+      float Esun[9] = {1969.0, 1840.0, 1551.0, 1044.0, 255.7, 1000.0, 1000.0, 82.07, 1000.0};
       float angle = 90.0-readMeta("SUN_ELEVATION = ");
       // A loop to find the Lhaze_1%rad.
       float lHazeOnePercent = minNonZero*multValue+addValue;
@@ -187,7 +195,7 @@ printf("===STAGE 1: DN -> TOA Radiance -> Surface reflectance===\n");
         for(int y=0;y<ysize;y++){
           if(imgData[y*xsize+x] < min){min = imgData[y*xsize+x];}
           if(imgData[y*xsize+x] > max){max = imgData[y*xsize+x];}
-          outData[(y*xsize+x)*3+(band-2)] = imgData[y*xsize+x];
+          outData[(y*xsize+x)*3+(band-1)] = imgData[y*xsize+x];
         }
       }
       printf("...done (noData pixels = %lu, Min nonzero value is %u, minmax = %f, %f)\n", noDataCount, minNonZero, min, max);
@@ -199,29 +207,18 @@ printf("===STAGE 1: DN -> TOA Radiance -> Surface reflectance===\n");
    At the time I do not plan on cloud-shadow masking yet...
 */
 printf("===STAGE 2: Mask Creation===\n");
-// Cloud mask from the BQA band poDataset[11] is used.
+// Cloud mask does not exists, so only data mask is done
 
    /*Block for the masking -- abusing C++ scoping*/{
-      Mat imageBuffer;
-      imageBuffer.create(ysize, xsize, CV_16UC1);
-      // Load data in as uint16_t (i.e., GDT_UInt16 or CV_16U)
-      imageBuffer.zeros(ysize, xsize, CV_16UC1);
-      poDataset[11]->RasterIO(GF_Read, 0, 0, xsize, ysize,
-                              (void*) imageBuffer.ptr(0), xsize, ysize,
-                              GDT_UInt16, 1, bandArray, 0, 0, 0);
-      // if it is likely cloud, or it is a fill
-      // Or if any of the existing band is NaN, mark all as NaN
-      // For more detail, read https://landsat.usgs.gov/L8QualityAssessmentBand.php
       uint64_t noDataCount = 0;
       #pragma omp parallel for reduction(+:noDataCount) collapse(2)
       for(int x=0;x<xsize;x++){
         for(int y=0;y<ysize;y++){
           float* outBfrData = (float*)(outputBuffer.data);
-          uint16_t value = ((uint16_t*)(imageBuffer.data))[y*xsize+x];
           float value0 = outBfrData[(y*xsize+x)*3+0];
           float value1 = outBfrData[(y*xsize+x)*3+1];
           float value2 = outBfrData[(y*xsize+x)*3+2];
-          if((value&0x81)>0 || isnan(value0) || isnan(value1) || isnan(value2)){
+          if(isnan(value0) || isnan(value1) || isnan(value2)){
             noDataCount++;
             outBfrData[(y*xsize+x)*3+0] = outBfrData[(y*xsize+x)*3+1] = outBfrData[(y*xsize+x)*3+2] = NAN;
           }
@@ -261,7 +258,8 @@ printf("===STAGE 4: Store the Result===\n");
 
     // OpenCV -> Pixel interleaving; GDAL -> (Should I choose?)
     // (The suffix must be .tif? Strange GDAL)
-    outputDataset = geoTiffDriver->Create("clear_geotiff.tif", xsize, ysize, 3, GDT_UInt16, papszOptions);
+    sprintf(filename,"%s_clear.tif",basename);
+    outputDataset = geoTiffDriver->Create(filename, xsize, ysize, 3, GDT_UInt16, papszOptions);
     if(outputDataset == NULL){
       fprintf(stderr,"Cannot open new dataset.\n");exit(-1);
     }
@@ -280,13 +278,13 @@ printf("===STAGE 4: Store the Result===\n");
     imageBuffer.create(ysize, xsize, CV_32F);
     float* imgData = ((float*)(imageBuffer.data));
     float* outData = ((float*)(outputBuffer.data));
-    for(band=4;band>=2;band--){
-      bandArray[0]=4-band+1;
+    for(band=3;band>=1;band--){
+      bandArray[0]=4-band;
       printf("Writing data to band %d\n", band);
       #pragma omp parallel for collapse(2)
       for(int x=0;x<xsize;x++){
         for(int y=0;y<ysize;y++){
-          imgData[y*xsize+x] = outData[(y*xsize+x)*3+(band-2)];
+          imgData[y*xsize+x] = outData[(y*xsize+x)*3+(band-1)];
         }
       }
       outputDataset->RasterIO(GF_Write, 0, 0, xsize, ysize,
@@ -300,7 +298,7 @@ printf("===STAGE 4: Store the Result===\n");
     delete outputDataset; // Close file?
 
   // Free the resources
-    for(band=0;band<=11;band++){
+    for(band=0;band<=8;band++){
       delete poDataset[band];
       poDataset[band] = NULL;
     }
