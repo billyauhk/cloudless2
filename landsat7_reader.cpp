@@ -133,23 +133,25 @@ printf("===STAGE 1: DN -> TOA Radiance -> Surface reflectance===\n");
       printf("Reading data from band %d...",band);
       bandArray[0] = 1;
       Mat imageBuffer;
-      imageBuffer.create(ysize, xsize, CV_16UC1);
+      imageBuffer.create(ysize, xsize, CV_8UC1);
       // Load data in as uint16_t (i.e., GDT_UInt16 or CV_16U)
-      imageBuffer.zeros(ysize, xsize, CV_16UC1);
+      imageBuffer.zeros(ysize, xsize, CV_8UC1);
       poDataset[band-1]->RasterIO(GF_Read, 0, 0, xsize, ysize,
                                          (void*) imageBuffer.ptr(0), xsize, ysize,
-                                         GDT_UInt16, 1, bandArray, 0, 0, 0);
+                                         GDT_Byte, 1, bandArray, 0, 0, 0);
   // Find the minimum non-zero value which would be corresponds to Lhaze_1%rad later
-      uint16_t minNonZero = 65535;
+      uint16_t minNonZero = 255;
       uint64_t noDataCount = 0;
       #pragma omp parallel for reduction(min:minNonZero) reduction(+:noDataCount)
-      for(int x=0;x<xsize;x++){
-        for(int y=0;y<ysize;y++){
-          uint16_t value = ((uint16_t*)(imageBuffer.data))[y*xsize+x];
+      for(int x=(xsize/2-xsize/4);x<(xsize/2+xsize/4);x++){
+        for(int y=(ysize/2-ysize/4);y<(ysize/2+ysize/4);y++){
+          uint8_t value = ((uint8_t*)(imageBuffer.data))[y*xsize+x];
           if(value==0){noDataCount++;}
           else if(value<minNonZero){minNonZero=value;}
         }
       }
+      printf("Band %d MinNonZero = %u\n", band, minNonZero);
+      printf("Bounds: %u %u %u %u", (xsize/2 - xsize/4), (xsize/2 + xsize/4), (ysize/2 - ysize/4), (ysize/2 + ysize/4));
 
   /* Get the TOA reflectance, solar angle adjusted with metadata basename_MTL.txt
      For landsat 7 documentation is at: http://landsathandbook.gsfc.nasa.gov/data_prod/prog_sect11_3.html
@@ -193,6 +195,7 @@ printf("===STAGE 1: DN -> TOA Radiance -> Surface reflectance===\n");
       #pragma omp parallel for reduction(min:min) reduction(max:max)
       for(int x=0;x<xsize;x++){
         for(int y=0;y<ysize;y++){
+          if(imgData[y*xsize+x] < 0){imgData[y*xsize+x]=0;} // Overwrite fringe
           if(imgData[y*xsize+x] < min){min = imgData[y*xsize+x];}
           if(imgData[y*xsize+x] > max){max = imgData[y*xsize+x];}
           outData[(y*xsize+x)*3+(band-1)] = imgData[y*xsize+x];
