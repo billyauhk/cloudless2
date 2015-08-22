@@ -46,6 +46,10 @@ int main(int argc, char* argv[]){
 // Data to be loaded
   // RGB(432) + Panochromatic(8) + BQA(BQA)
   GDALDataset *poDataset[12];
+  uint64_t bandNoDataCount[12];
+  float bandMinNonZero[12];
+  float bandMin[12];
+  float bandMax[12];
   uint16_t band;
   uint64_t xsize, ysize;
 
@@ -187,6 +191,10 @@ printf("===STAGE 1: DN -> TOA Radiance -> Surface reflectance===\n");
         }
       }
       printf("...done (noData pixels = %lu, Min nonzero value is %u, minmax = %f, %f)\n", noDataCount, minNonZero, min, max);
+      bandNoDataCount[band-1] = noDataCount;
+      bandMinNonZero[band-1] = minNonZero;
+      bandMin[band-1] = min;
+      bandMax[band-1] = max;
     }
 
 /* Image masking and spatial processing: Pipeline as follows:
@@ -231,11 +239,12 @@ printf("===STAGE 2: Mask Creation===\n");
    Part(3): Zooming, Read Panochromatic -> PANSHARP
             -> Output 3-channel PANSHARP-ed+Alpha 32-bit GeoTIFF, with NaN if necessary (OpenCV imwrite is not GeoTIFF/32-bit depth friendly)
 */
+
 printf("===STAGE 3: Pansharp=== (SKIPPED)\n");
   // One should be able to get coordinate with GDALApplyGeoTransform() (or maybe also GDALInvGeoTransform())
 
 printf("===STAGE 4: Store the Result===\n");
-  normalize(outputBuffer, outputBuffer, 65536, 0, NORM_MINMAX, -1);
+//  normalize(outputBuffer, outputBuffer, 65536, 0, NORM_MINMAX, -1);
   //outputBuffer.convertTo(outputBuffer, CV_16U);
 
   // Saving using GDAL's writing facility
@@ -277,13 +286,14 @@ printf("===STAGE 4: Store the Result===\n");
     imageBuffer.create(ysize, xsize, CV_32F);
     float* imgData = ((float*)(imageBuffer.data));
     float* outData = ((float*)(outputBuffer.data));
+
     for(band=4;band>=2;band--){
       bandArray[0]=4-band+1;
       printf("Writing data to band %d\n", band);
       #pragma omp parallel for collapse(2)
       for(int x=0;x<xsize;x++){
         for(int y=0;y<ysize;y++){
-          imgData[y*xsize+x] = outData[(y*xsize+x)*3+(band-2)];
+          imgData[y*xsize+x] = (float) outData[(y*xsize+x)*3+(band-2)]*65536.0f; // Self-written normalize
         }
       }
       outputDataset->RasterIO(GF_Write, 0, 0, xsize, ysize,
